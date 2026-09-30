@@ -52,6 +52,18 @@ class DuplicateRoleTest(TestCase):
         )
         self.assertFalse(RoleRight.objects.filter(role=copy, right_id=9002).exists())
 
+    def test_duplicate_with_a_repeated_right_id_writes_one_live_row(self):
+        source = _role()
+        _right(source, 9001)
+
+        copy = duplicate_role(
+            {"uuid": source.uuid, "name": "Copy", "rights_id": [9001, 9002, 9001, "9002"]},
+            None,
+        )
+
+        self.assertEqual(_live(copy), Counter({9001: 1, 9002: 1}))
+        self.assertEqual(RoleRight.objects.filter(role=copy).count(), 2)
+
     def test_duplicate_leaves_the_source_untouched(self):
         source = _role()
         _right(source, 9001)

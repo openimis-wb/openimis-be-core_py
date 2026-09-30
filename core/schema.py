@@ -1482,6 +1482,8 @@ def duplicate_role(data, user):
         data.pop("client_mutation_label")
     role_uuid = data.pop("uuid") if "uuid" in data else None
     rights_id = data.pop("rights_id") if "rights_id" in data else None
+    if rights_id:
+        rights_id = _distinct_right_ids(rights_id)
     # get the current Role object to be duplicated
     role = Role.objects.get(uuid=role_uuid)
     # copy Role to be dupliacated
