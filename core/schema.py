@@ -1400,6 +1400,11 @@ class RoleBase:
     system_role_id = graphene.Int(required=False)
 
 
+def _distinct_right_ids(rights_id):
+    """Right ids in first-seen order, each once; a pair gets one row."""
+    return list(dict.fromkeys(int(right_id) for right_id in rights_id))
+
+
 def update_or_create_role(data, user):
     client_mutation_id = data.get("client_mutation_id", None)
     # client_mutation_label = data.get("client_mutation_label", None)
@@ -1410,6 +1415,8 @@ def update_or_create_role(data, user):
         data.pop("client_mutation_label")
     role_uuid = data.pop("uuid") if "uuid" in data else None
     rights_id = data.pop("rights_id") if "rights_id" in data else None
+    if rights_id is not None:
+        rights_id = _distinct_right_ids(rights_id)
     if role_uuid:
         role = Role.objects.get(uuid=role_uuid)
         role.save_history()
@@ -1508,7 +1515,9 @@ def duplicate_role(data, user):
                 }
             )
     else:
-        role_rights_currently_assigned = RoleRight.objects.filter(role_id=role.id)
+        role_rights_currently_assigned = RoleRight.objects.filter(
+            role_id=role.id, validity_to__isnull=True
+        )
         [
             RoleRight.objects.create(
                 **{
