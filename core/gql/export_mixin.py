@@ -4,7 +4,9 @@ import types
 from typing import Dict, List, Callable
 
 import graphene
+from django.core.exceptions import FieldDoesNotExist
 from graphene.types.generic import GenericScalar
+from graphene_django import DjangoObjectType
 from pandas import DataFrame
 
 from core.custom_filters import CustomFilterWizardStorage
@@ -81,6 +83,67 @@ class ExportableQueryMixin:
             new_args["fields_columns"] = GenericScalar()
             setattr(cls, field_name, graphene.Field(graphene.String, args=new_args))
             cls.create_export_function(field)
+            cls._guard_export_fields(field)
+
+    @classmethod
+    def _guard_export_fields(cls, field_name):
+        """
+        Wraps the export resolver so that every requested field is a path the
+        exported GraphQL type exposes; any other path is refused before the
+        query runs. Subclasses overriding `create_export_function` stay covered.
+        """
+        resolver_name = f"resolve_{field_name}_export"
+        export_resolver = getattr(cls, resolver_name)
+
+        def guarded_exporter(cls, self, info, **kwargs):
+            node_type = cls._unwrap_graphql_type(getattr(cls, field_name).type)
+            for field in kwargs.get("fields") or []:
+                path = cls._adjust_notation(field).split("__")
+                if not cls._is_exposed_path(node_type, path):
+                    raise ValueError(f"Field '{field}' cannot be exported.")
+            return export_resolver(self, info, **kwargs)
+
+        setattr(cls, resolver_name, types.MethodType(guarded_exporter, cls))
+
+    @classmethod
+    def _unwrap_graphql_type(cls, graphql_type):
+        while True:
+            if isinstance(graphql_type, (graphene.List, graphene.NonNull)):
+                graphql_type = graphql_type.of_type
+            elif isinstance(graphql_type, type) and issubclass(graphql_type, graphene.relay.Connection):
+                graphql_type = graphql_type._meta.node
+            else:
+                return graphql_type
+
+    @classmethod
+    def _is_exposed_path(cls, graphql_type, path):
+        """
+        A path is exposed when each segment is a field of the GraphQL type at
+        its level and a field of that type's model, and every segment but the
+        last is a relation to the model of the next type.
+        """
+        if not (isinstance(graphql_type, type) and issubclass(graphql_type, DjangoObjectType)):
+            return False
+        name, rest = path[0], path[1:]
+        graphql_field = graphql_type._meta.fields.get(name)
+        if isinstance(graphql_field, graphene.Dynamic):
+            graphql_field = graphql_field.get_type()
+        if graphql_field is None:
+            return False
+        try:
+            model_field = graphql_type._meta.model._meta.get_field(name)
+        except FieldDoesNotExist:
+            return False
+        if not rest:
+            return True
+        if not model_field.is_relation:
+            return False
+        next_type = cls._unwrap_graphql_type(graphql_field.type)
+        if not (isinstance(next_type, type) and issubclass(next_type, DjangoObjectType)):
+            return False
+        if next_type._meta.model is not model_field.related_model:
+            return False
+        return cls._is_exposed_path(next_type, rest)
 
     @classmethod
     def _adjust_notation(cls, field):
