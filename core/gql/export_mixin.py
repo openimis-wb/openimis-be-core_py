@@ -1,19 +1,23 @@
 import json
 import logging
+import re
 import types
 from typing import Dict, List, Callable
 
 import graphene
 from django.core.exceptions import FieldDoesNotExist
+from django.db import models
 from graphene.types.generic import GenericScalar
 from graphene_django import DjangoObjectType
 from pandas import DataFrame
 
 from core.custom_filters import CustomFilterWizardStorage
-from core.models import ExportableQueryModel
+from core.models import ExportableQueryModel, User
 
 
 logger = logging.getLogger(__file__)
+
+_JSON_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class ExportableQueryMixin:
@@ -120,7 +124,9 @@ class ExportableQueryMixin:
         """
         A path is exposed when each segment is a field of the GraphQL type at
         its level and a field of that type's model, and every segment but the
-        last is a relation to the model of the next type.
+        last is a relation to the model of the next type. A JSON field may be
+        followed by one simple key. No segment may be a relation to a model of
+        the `core` app, except a final `username` on `User`.
         """
         if not (isinstance(graphql_type, type) and issubclass(graphql_type, DjangoObjectType)):
             return False
@@ -134,8 +140,13 @@ class ExportableQueryMixin:
             model_field = graphql_type._meta.model._meta.get_field(name)
         except FieldDoesNotExist:
             return False
+        if model_field.is_relation and model_field.related_model._meta.app_label == "core":
+            if not (model_field.related_model is User and rest == ["username"]):
+                return False
         if not rest:
             return True
+        if isinstance(model_field, models.JSONField):
+            return len(rest) == 1 and bool(_JSON_KEY.fullmatch(rest[0]))
         if not model_field.is_relation:
             return False
         next_type = cls._unwrap_graphql_type(graphql_field.type)
