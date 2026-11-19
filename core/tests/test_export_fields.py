@@ -71,9 +71,10 @@ class ExportFieldsTestCase(TestCase):
         for field in ("tUser.password", "username.length", "pk", "i_user____id", ""):
             with self.subTest(field=field):
                 result = self._export(["id", field])
+                contents = self._exported_files()
                 self.assertIsNotNone(result.errors)
                 self.assertIn("cannot be exported", str(result.errors[0]))
-                self.assertEqual(self._exported_files(), [])
+                self.assertEqual(contents, [])
 
     def test_exports_fields_exposed_by_the_type(self):
         result = self._export(["id", "username", "iUser.lastName", "i_user__login_name"])
