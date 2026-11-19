@@ -101,7 +101,12 @@ class ExportableQueryMixin:
 
         def guarded_exporter(cls, self, info, **kwargs):
             node_type = cls._unwrap_graphql_type(getattr(cls, field_name).type)
-            for field in kwargs.get("fields") or []:
+            fields = kwargs.get("fields")
+            if not fields:
+                raise ValueError(f"Field '{fields}' cannot be exported.")
+            for field in fields:
+                if not isinstance(field, str):
+                    raise ValueError(f"Field '{field}' cannot be exported.")
                 path = cls._adjust_notation(field).split("__")
                 if not cls._is_exposed_path(node_type, path):
                     raise ValueError(f"Field '{field}' cannot be exported.")
@@ -122,39 +127,70 @@ class ExportableQueryMixin:
     @classmethod
     def _is_exposed_path(cls, graphql_type, path):
         """
-        A path is exposed when each segment is a field of the GraphQL type at
-        its level and a field of that type's model, and every segment but the
-        last is a relation to the model of the next type. A JSON field may be
-        followed by one simple key. No segment may be a relation to a model of
-        the `core` app, except a final `username` on `User`.
+        A path reads the exported row only: one of its concrete fields, or
+        `json_ext` and one key, or one forward foreign key or one-to-one followed
+        by one concrete field of the target, or the target's `json_ext` and one
+        key. Reverse relations, many-to-many, generic relations and `core` models
+        other than a final `username` on `User` are refused. Every segment must
+        be a field of the GraphQL type at its level.
         """
-        if not (isinstance(graphql_type, type) and issubclass(graphql_type, DjangoObjectType)):
+        model_field, graphql_field = cls._exposed_field(graphql_type, path[0])
+        if model_field is None:
             return False
-        name, rest = path[0], path[1:]
+        rest = path[1:]
+        if not model_field.is_relation:
+            return cls._is_value_path(model_field, rest)
+        if not cls._is_forward_single_relation(model_field):
+            return False
+        target = model_field.related_model
+        if target._meta.app_label == "core" and not (target is User and rest == ["username"]):
+            return False
+        if not rest:
+            return True
+        next_type = cls._unwrap_graphql_type(graphql_field.type)
+        if not (isinstance(next_type, type) and issubclass(next_type, DjangoObjectType)):
+            return False
+        if next_type._meta.model is not target:
+            return False
+        target_field, _ = cls._exposed_field(next_type, rest[0])
+        if target_field is None or target_field.is_relation:
+            return False
+        return cls._is_value_path(target_field, rest[1:])
+
+    @classmethod
+    def _exposed_field(cls, graphql_type, name):
+        if not (isinstance(graphql_type, type) and issubclass(graphql_type, DjangoObjectType)):
+            return None, None
         graphql_field = graphql_type._meta.fields.get(name)
         if isinstance(graphql_field, graphene.Dynamic):
             graphql_field = graphql_field.get_type()
         if graphql_field is None:
-            return False
+            return None, None
         try:
-            model_field = graphql_type._meta.model._meta.get_field(name)
+            return graphql_type._meta.model._meta.get_field(name), graphql_field
         except FieldDoesNotExist:
+            return None, None
+
+    @classmethod
+    def _is_value_path(cls, model_field, rest):
+        if not model_field.concrete:
             return False
-        if model_field.is_relation and model_field.related_model._meta.app_label == "core":
-            if not (model_field.related_model is User and rest == ["username"]):
-                return False
         if not rest:
             return True
-        if isinstance(model_field, models.JSONField):
-            return len(rest) == 1 and bool(_JSON_KEY.fullmatch(rest[0]))
-        if not model_field.is_relation:
-            return False
-        next_type = cls._unwrap_graphql_type(graphql_field.type)
-        if not (isinstance(next_type, type) and issubclass(next_type, DjangoObjectType)):
-            return False
-        if next_type._meta.model is not model_field.related_model:
-            return False
-        return cls._is_exposed_path(next_type, rest)
+        return (
+            model_field.name == "json_ext"
+            and isinstance(model_field, models.JSONField)
+            and len(rest) == 1
+            and bool(_JSON_KEY.fullmatch(rest[0]))
+        )
+
+    @classmethod
+    def _is_forward_single_relation(cls, model_field):
+        return (
+            model_field.concrete
+            and not model_field.auto_created
+            and (model_field.many_to_one or model_field.one_to_one)
+        )
 
     @classmethod
     def _adjust_notation(cls, field):

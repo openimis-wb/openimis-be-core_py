@@ -105,6 +105,24 @@ class ExportFieldsTestCase(TestCase):
             with self.subTest(field=field):
                 self._assert_refused(field)
 
+    def test_refuses_missing_empty_and_null_fields(self):
+        query = """
+            query ($clientMutationId: String) {
+                mutationLogsExport(clientMutationId: $clientMutationId, fieldsColumns: "{}")
+            }
+        """
+        missing = self.schema.execute(
+            query,
+            variables={"clientMutationId": self.client_mutation_id},
+            context_value=types.SimpleNamespace(user=self.requester),
+        )
+        for result in (missing, self._export([]), self._export([None]), self._export(["id", None])):
+            with self.subTest(errors=result.errors):
+                contents = self._exported_files()
+                self.assertIsNotNone(result.errors)
+                self.assertIn("cannot be exported", str(result.errors[0]))
+                self.assertEqual(contents, [])
+
     def test_exports_fields_exposed_by_the_type(self):
         result = self._export(["id", "client_mutation_label", "user.username", "json_ext__k1"])
 
