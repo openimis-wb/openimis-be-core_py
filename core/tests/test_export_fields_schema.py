@@ -3,12 +3,14 @@ from datetime import date
 from decimal import Decimal
 
 from django.contrib.contenttypes.models import ContentType
-from django.test import TestCase
+from django.core.cache import cache
+from django.test import TestCase, override_settings
 
 from core.models import ExportableQueryModel
-from core.test_helpers import create_test_interactive_user
+from core.test_helpers import create_test_interactive_user, create_test_role
 from individual.models import Group, GroupIndividual, Individual
 from invoice.models import Bill
+from location.test_helpers import assign_user_districts, create_test_village
 from social_protection.export_mixin import ExportableSocialProtectionQueryMixin
 from social_protection.models import BeneficiaryStatus, Beneficiary, BenefitPlan, GroupBeneficiary
 
@@ -152,3 +154,72 @@ class ExportFieldsSchemaTestCase(TestCase):
         self.assertIn("create_export_function", ExportableSocialProtectionQueryMixin.__dict__)
         result, _ = self._export("beneficiaryExport", ["id", "json_ext", "individual.groupindividuals.role"])
         self.assertIn("cannot be exported", str(result.errors[0]))
+
+
+@override_settings(ROW_SECURITY=True)
+class GroupIndividualExportRowScopeTestCase(TestCase):
+    """
+    groupIndividualExport keeps the members the group member list shows: an
+    account limited to some districts exports no member of a group located
+    in another district.
+    """
+
+    password = "EdfmD3!12@#"
+
+    @classmethod
+    def setUpTestData(cls):
+        own_village = create_test_village({"code": "EXSCA"})
+        other_village = create_test_village({"code": "EXSCB"})
+        group_search_role = create_test_role(perm_names=["gql_group_search_perms"], name="ExportRowScopeGroupSearch")
+        cls.restricted = create_test_interactive_user(
+            username="export_scope_district", password=cls.password, roles=[group_search_role.id])
+        assign_user_districts(cls.restricted, ["D-EXSCA"])
+        cls.superuser = create_test_interactive_user(username="export_scope_admin", password=cls.password)
+        cls.own_group = cls._group_with_member("EXSCGRPA", own_village, "InDistrictMember")
+        cls.other_group = cls._group_with_member("EXSCGRPB", other_village, "OutOfDistrictMember")
+        cache.clear()
+
+    @classmethod
+    def _group_with_member(cls, code, village, first_name):
+        group = Group(code=code, location=village, json_ext={})
+        group.save(user=cls.superuser)
+        individual = Individual(first_name=first_name, last_name="ExportScope", dob="1990-01-01", json_ext={})
+        individual.save(user=cls.superuser)
+        GroupIndividual(group=group, individual=individual, role="HEAD", json_ext={}).save(user=cls.superuser)
+        return group
+
+    def _export(self, requester, group):
+        from openIMIS.schema import schema
+
+        query = 'query { groupIndividualExport(group_Id: "%s", fields: ["individual__first_name"], ' \
+                'fieldsColumns: "{}") }' % group.id
+        result = schema.execute(query, context_value=types.SimpleNamespace(user=requester))
+        contents = []
+        for export in ExportableQueryModel.objects.filter(user=requester):
+            contents.append(export.content.read().decode())
+            export.content.delete(save=False)
+            export.delete()
+        return result, contents
+
+    def test_preconditions(self):
+        self.assertFalse(self.restricted.is_imis_admin)
+        self.assertTrue(self.superuser.is_imis_admin)
+
+    def test_restricted_account_exports_the_members_of_a_group_in_its_district(self):
+        result, contents = self._export(self.restricted, self.own_group)
+
+        self.assertIsNone(result.errors)
+        self.assertEqual(len(contents), 1)
+        self.assertIn("InDistrictMember", contents[0])
+
+    def test_restricted_account_exports_no_member_of_a_group_in_another_district(self):
+        _, contents = self._export(self.restricted, self.other_group)
+
+        self.assertFalse(any("OutOfDistrictMember" in c for c in contents))
+
+    def test_superuser_exports_the_members_of_a_group_in_any_district(self):
+        result, contents = self._export(self.superuser, self.other_group)
+
+        self.assertIsNone(result.errors)
+        self.assertEqual(len(contents), 1)
+        self.assertIn("OutOfDistrictMember", contents[0])

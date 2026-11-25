@@ -86,8 +86,43 @@ class ExportableQueryMixin:
             new_args["fields"] = graphene.List(of_type=graphene.String)
             new_args["fields_columns"] = GenericScalar()
             setattr(cls, field_name, graphene.Field(graphene.String, args=new_args))
-            cls.create_export_function(field)
+            cls._create_row_scoped_export_function(field)
             cls._guard_export_fields(field)
+
+    @classmethod
+    def _create_row_scoped_export_function(cls, field_name):
+        """
+        Builds the export over the list resolver restricted, by a primary-key
+        subquery, to the rows the exported node type's `get_queryset` keeps, so
+        a scope joining a multi-valued relation adds no duplicate line.
+        `resolve_<field>` holds the scoped resolver only while
+        `create_export_function` runs; an override reading it later gets the
+        list's unscoped resolver.
+        """
+        resolver_name = f"resolve_{field_name}"
+        list_resolver = getattr(cls, resolver_name, None)
+        if not list_resolver:
+            cls.create_export_function(field_name)
+            return
+
+        def scoped_resolver(root, info, **kwargs):
+            queryset = list_resolver(root, info, **kwargs)
+            node_type = cls._unwrap_graphql_type(getattr(cls, field_name).type)
+            scoped = node_type.get_queryset(queryset, info)
+            if scoped is queryset:
+                return queryset
+            return queryset.filter(pk__in=scoped.values("pk"))
+
+        has_own_resolver = resolver_name in cls.__dict__
+        own_resolver = cls.__dict__.get(resolver_name)
+        setattr(cls, resolver_name, scoped_resolver)
+        try:
+            cls.create_export_function(field_name)
+        finally:
+            if has_own_resolver:
+                setattr(cls, resolver_name, own_resolver)
+            else:
+                delattr(cls, resolver_name)
 
     @classmethod
     def _guard_export_fields(cls, field_name):
