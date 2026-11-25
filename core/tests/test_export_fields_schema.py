@@ -1,10 +1,13 @@
+import inspect
 import types
 from datetime import date
 from decimal import Decimal
+from unittest import mock
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
 from django.test import TestCase, override_settings
+from graphene.utils.str_converters import to_snake_case
 
 from core.models import ExportableQueryModel
 from core.test_helpers import create_test_interactive_user, create_test_role
@@ -213,8 +216,14 @@ class GroupIndividualExportRowScopeTestCase(TestCase):
         self.assertIn("InDistrictMember", contents[0])
 
     def test_restricted_account_exports_no_member_of_a_group_in_another_district(self):
-        _, contents = self._export(self.restricted, self.other_group)
+        with mock.patch.object(
+                ExportableQueryModel, "create_csv_export", wraps=ExportableQueryModel.create_csv_export) as csv_export:
+            _, contents = self._export(self.restricted, self.other_group)
 
+        csv_export.assert_called_once()
+        exported_rows = csv_export.call_args.args[0]
+        self.assertEqual(exported_rows.model, GroupIndividual)
+        self.assertEqual(list(exported_rows), [])
         self.assertFalse(any("OutOfDistrictMember" in c for c in contents))
 
     def test_superuser_exports_the_members_of_a_group_in_any_district(self):
@@ -223,3 +232,39 @@ class GroupIndividualExportRowScopeTestCase(TestCase):
         self.assertIsNone(result.errors)
         self.assertEqual(len(contents), 1)
         self.assertIn("OutOfDistrictMember", contents[0])
+
+
+SCOPED_RESOLVER = "ExportableQueryMixin._create_row_scoped_export_function.<locals>.scoped_resolver"
+
+
+def _reachable_functions(function, depth=4):
+    """The function and those its closure cells hold, through bound methods, down to `depth` levels."""
+    found = []
+    pending = [(function, 0)]
+    while pending:
+        current, level = pending.pop()
+        current = getattr(current, "__func__", current)
+        found.append(current)
+        if level < depth:
+            for cell in getattr(current, "__closure__", None) or ():
+                if callable(cell.cell_contents):
+                    pending.append((cell.cell_contents, level + 1))
+    return found
+
+
+class AssembledExportsRowScopeTestCase(TestCase):
+    """Every export of the assembled schema is built over the row-scoped resolver of its own list field."""
+
+    def test_every_export_reads_the_row_scoped_list_resolver(self):
+        from openIMIS.schema import schema
+
+        query_type = schema.get_query_type()
+        export_names = [name for name in query_type.fields if name.endswith("Export")]
+        self.assertLessEqual(set(CLIENT_EXPORTS), set(export_names))
+        for name in export_names:
+            with self.subTest(export=name):
+                list_field = to_snake_case(name)[:-len("_export")]
+                export_resolver = getattr(query_type.graphene_type, f"resolve_{list_field}_export")
+                scoped = [f for f in _reachable_functions(export_resolver) if f.__qualname__ == SCOPED_RESOLVER]
+                self.assertEqual(len(scoped), 1)
+                self.assertEqual(inspect.getclosurevars(scoped[0]).nonlocals["field_name"], list_field)
